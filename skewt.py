@@ -106,12 +106,17 @@ def make_msl_height_functions(sounding_df, unit='km'):
     return pressure_to_height, height_to_pressure_mb
 
 
-def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz_offset, tz_abbr,
+def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
                        forecast_high=None, is_forecast=True, location_desc=None,
                        title_prefix=None, run_label=None, is_modeled=False, site_name=None,
                        station=None, altitude_unit=DEFAULT_ALTITUDE_UNIT):
     """Draw one full Skew-T panel (data, barbs, adiabats, altitude axis,
     title) into the given subplot position of fig.
+
+    tz is a tzinfo (the site's own zone) that sounding_date is converted
+    through for the title, rather than a fixed offset -- so a sounding
+    from the other side of a DST transition is labelled with the offset
+    that was actually in force on its date.
 
     station is only used to build the default title when title_prefix
     isn't given; altitude_unit picks the MSL axis' unit ('km' or 'kft')."""
@@ -506,9 +511,9 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz_offset, tz_a
     # row for row instead of the left title's extra lines (which can run
     # long, e.g. a full airport name) colliding with the right title's
     # single line sharing that row.
-    local_dt = sounding_date.replace(tzinfo=None) + tz_offset
+    local_dt = sounding_date.astimezone(tz)
     title_left = title_prefix if title_prefix is not None else f'{station} Observed Sounding'
-    title_right = f'{local_dt:%Y-%m-%d %H:%M} {tz_abbr}'
+    title_right = f'{local_dt:%Y-%m-%d %H:%M %Z}'
     extra_left_lines = [line for line in (site_name, location_desc) if line]
     if extra_left_lines:
         title_left += '\n' + '\n'.join(extra_left_lines)

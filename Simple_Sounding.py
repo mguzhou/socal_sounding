@@ -13,6 +13,7 @@ for a station, using MetPy, siphon, and Open-Meteo.
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
 # Non-interactive backend: every output here goes through fig.savefig, and
@@ -195,21 +196,31 @@ def main(args=None, output_dir=None):
     else:
         raise RuntimeError(f'Open-Meteo forecast request missing "daily" after 3 tries: {forecast}')
     forecast_high = forecast['daily']['temperature_2m_max'][0]
-    tz_offset = timedelta(seconds=forecast.get('utc_offset_seconds', 0))
-    tz_abbr = forecast.get('timezone_abbreviation', '')
+
+    # The IANA zone name, not Open-Meteo's utc_offset_seconds: that field
+    # is the zone's offset *right now*, not on the sounding's own date, so
+    # using it mislabels anything on the other side of a DST transition by
+    # an hour (a January sounding rendered in July came out as GMT-7 when
+    # it was really PST/GMT-8). Converting each instant through the zone
+    # itself gets the historical offset right, and gives a real PST/PDT
+    # abbreviation instead of a generic GMT-7.
+    try:
+        tz = ZoneInfo(forecast['timezone'])
+    except (KeyError, ZoneInfoNotFoundError):
+        tz = timezone.utc
 
     # Label the model run that actually generated this profile whenever it's
     # a real forecast (run time != valid time) -- otherwise it's implicit
     # (the sounding's own time in the title already is the run time).
     run_label = None
     if model_run_date is not None and model_run_date != date:
-        run_local_dt = model_run_date.replace(tzinfo=None) + tz_offset
-        run_label = f'Model run: {run_local_dt:%Y-%m-%d %H:%M} {tz_abbr}'
+        run_local_dt = model_run_date.astimezone(tz)
+        run_label = f'Model run: {run_local_dt:%Y-%m-%d %H:%M %Z}'
 
     fig = plt.figure(figsize=(9.5, 10))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.14)
     skew, parcel_p_path, parcel_profile, parcel_env_T = render_skewt_panel(
-        fig, gs[0, 0], df, date, tz_offset, tz_abbr,
+        fig, gs[0, 0], df, date, tz,
         forecast_high=forecast_high, is_forecast=is_forecast,
         location_desc=location_desc, title_prefix=title_prefix,
         run_label=run_label, is_modeled=args.lat is not None, site_name=args.name,
@@ -226,7 +237,7 @@ def main(args=None, output_dir=None):
         compare_p = compare_df['pressure'].values * units.hPa
         compare_T = compare_df['temperature'].values * units.degC
         compare_Td = compare_df['dewpoint'].values * units.degC
-        compare_local_dt = compare_date.replace(tzinfo=None) + tz_offset
+        compare_local_dt = compare_date.astimezone(tz)
 
         # Default (no --compare/--compare-station given) reads as "the
         # previous run"; an explicit comparison names the station whenever
