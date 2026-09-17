@@ -43,7 +43,7 @@ from metpy.units import units
 from scipy.ndimage import median_filter
 
 from cli import parse_args
-from config import MODEL_PRIORITY, SHOW_PREVIOUS
+from config import MODEL_PRIORITY, SHOW_PREVIOUS, gmt_offset_label
 from geocode import describe_location
 from grib import fetch_hrrr_profile, fetch_rrfs_profile
 from lapse_rate import render_lapse_rate_panel
@@ -215,7 +215,8 @@ def main(args=None, output_dir=None):
     run_label = None
     if model_run_date is not None and model_run_date != date:
         run_local_dt = model_run_date.astimezone(tz)
-        run_label = f'Model run: {run_local_dt:%Y-%m-%d %H:%M %Z}'
+        run_label = (f'Model run: {run_local_dt:%Y-%m-%d %H:%M} '
+                     f'{gmt_offset_label(run_local_dt)} {run_local_dt:%Z}')
 
     fig = plt.figure(figsize=(9.5, 10))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.14)

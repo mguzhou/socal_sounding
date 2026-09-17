@@ -1,9 +1,25 @@
-"""Shared configuration: values more than one module needs.
+"""Shared configuration: values and small helpers more than one module
+needs.
 
 Deliberately free of project imports, so every other module can
 import this without any risk of an import cycle."""
 
+from datetime import timedelta
 from pathlib import Path
+
+
+def gmt_offset_label(dt):
+    """'GMT-7' for an aware datetime's own UTC offset, to sit in front of
+    the zone's abbreviation in a title ("14:00 GMT-7 PDT").
+
+    Taken from the datetime rather than the zone, so it reports the
+    offset in force on *that* date rather than today's -- the whole point
+    of converting through a real timezone. Half-hour and quarter-hour
+    zones come out as 'GMT+5:30' / 'GMT+5:45'."""
+    total_minutes = int((dt.utcoffset() or timedelta(0)).total_seconds()) // 60
+    sign = '-' if total_minutes < 0 else '+'
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f'GMT{sign}{hours}' + (f':{minutes:02d}' if minutes else '')
 
 
 # Priority order for modeled (arbitrary lat/lon) profiles -- RRFS first

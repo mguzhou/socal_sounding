@@ -8,7 +8,7 @@ from metpy.plots import SkewT
 from metpy.units import units
 from scipy.ndimage import median_filter
 
-from config import DEFAULT_ALTITUDE_UNIT, KM_TO_KFT
+from config import DEFAULT_ALTITUDE_UNIT, KM_TO_KFT, gmt_offset_label
 # The skew-T panel marks the surface inversion the lapse-rate panel
 # detects, so the detection itself lives there and is shared from there.
 from lapse_rate import find_surface_inversion_top
@@ -513,7 +513,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
     # single line sharing that row.
     local_dt = sounding_date.astimezone(tz)
     title_left = title_prefix if title_prefix is not None else f'{station} Observed Sounding'
-    title_right = f'{local_dt:%Y-%m-%d %H:%M %Z}'
+    title_right = f'{local_dt:%Y-%m-%d %H:%M} {gmt_offset_label(local_dt)} {local_dt:%Z}'
     extra_left_lines = [line for line in (site_name, location_desc) if line]
     if extra_left_lines:
         title_left += '\n' + '\n'.join(extra_left_lines)

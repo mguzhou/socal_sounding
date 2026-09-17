@@ -11,6 +11,7 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 import eccodes
 import metpy.calc as mpcalc
@@ -94,6 +95,45 @@ def _decode_grib_fields(grib_path, lat, lon):
     need decoding once (identical for every message sharing a grid
     definition, which every message in one of these subsets does) --
     not once per level/variable."""
+    lats, lons, cone, lov, values, tree = _load_fields(grib_path)
+    # lons is in eccodes' 0-360 convention (see the longitude-normalizing
+    # comment below) -- query with the same convention, or a -180..180
+    # input like -117 reads as numerically far from every real point in
+    # the grid's 225-299 range and returns nonsense (caught by exactly
+    # this: an early version of this query, without the % 360, matched
+    # coastal British Columbia for a San Diego-area query point).
+    _, idx = tree.query([lat, lon % 360])
+    nearest_lat, nearest_lon = float(lats[idx]), float(lons[idx])
+
+    levels = {}
+    for key, arr in values.items():
+        short_name, level_str = key.rsplit('_', 1)
+        level = int(level_str)
+        entry = levels.setdefault(level, {})
+        entry[short_name] = float(arr[idx])
+        if short_name in ('u', 'v', '10u', '10v'):
+            entry['_lat'], entry['_lon'] = nearest_lat, nearest_lon
+    return levels, cone, lov
+
+
+@lru_cache(maxsize=3)
+def _load_fields(grib_path):
+    """One cached GRIB2 subset's full field arrays, its grid, and a
+    KD-tree over that grid -- everything about a run that doesn't depend
+    on which point is being looked up.
+
+    Memoized because none of it does depend on the point: decompressing
+    the arrays and building the tree measured ~3.6s for one RRFS run, and
+    a batch of sites against that same run was paying it once per site
+    for an answer that never changed. The per-point work left downstream
+    is a single tree query, ~0.2 ms.
+
+    maxsize is small deliberately -- these are big (a 25-level, 5-variable
+    RRFS run is ~950 MB of float32 once decompressed) -- but not 1, since
+    a single profile touches three files (isobaric, surface and, where
+    published, native), and a cache of 1 would evict between them and
+    memoize nothing. A long-lived process that isn't batching should call
+    clear_field_cache() when it's done rather than hold that."""
     fields_path = grib_path.with_suffix('.fields.npz')
     if fields_path.exists():
         cached = np.load(fields_path)
@@ -140,24 +180,16 @@ def _decode_grib_fields(grib_path, lat, lon):
         tmp_path.rename(fields_path)
 
     tree = cKDTree(np.column_stack([lats, lons]))
-    # lons is in eccodes' 0-360 convention (see the longitude-normalizing
-    # comment below) -- query with the same convention, or a -180..180
-    # input like -117 reads as numerically far from every real point in
-    # the grid's 225-299 range and returns nonsense (caught by exactly
-    # this: an early version of this query, without the % 360, matched
-    # coastal British Columbia for a San Diego-area query point).
-    _, idx = tree.query([lat, lon % 360])
-    nearest_lat, nearest_lon = float(lats[idx]), float(lons[idx])
+    return lats, lons, cone, lov, values, tree
 
-    levels = {}
-    for key, arr in values.items():
-        short_name, level_str = key.rsplit('_', 1)
-        level = int(level_str)
-        entry = levels.setdefault(level, {})
-        entry[short_name] = float(arr[idx])
-        if short_name in ('u', 'v', '10u', '10v'):
-            entry['_lat'], entry['_lon'] = nearest_lat, nearest_lon
-    return levels, cone, lov
+
+def clear_field_cache():
+    """Drop the memoized field arrays and KD-trees (see _load_fields).
+
+    Worth calling from a long-running process that renders one profile at
+    a time -- the Telegram bot -- where the memo buys nothing across
+    requests but would otherwise pin ~1 GB for the life of the service."""
+    _load_fields.cache_clear()
 
 
 def _latest_available_run(model, max_tries=6):
@@ -194,6 +226,11 @@ NATIVE_LEVEL_PRODUCT = {'hrrr': 'nat', 'rrfs': 'natlev'}
 # isobaric spacing only samples 2-3 times -- 2-3x the near-surface
 # resolution without pulling all 50 levels up into the stratosphere.
 MAX_NATIVE_LEVEL = 15
+
+# (model, run, lead) triples already found to publish no native levels,
+# so the same negative network probe isn't repeated for every point looked
+# up against that run. Process-lifetime only -- a fresh run starts over.
+_NATIVE_UNAVAILABLE = set()
 
 
 def _fetch_terrain_height(model, lat, lon, max_tries=6):
@@ -351,6 +388,16 @@ def _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon,
     if product is None:
         return []
 
+    # A model that doesn't publish these (RRFS today) otherwise costs a
+    # network probe on every single call -- ~2.2s each, and for a batch of
+    # sites on one run that is the same negative answer over and over.
+    # Remembered per (model, run, lead) rather than per model, so it stays
+    # correct the day RRFS does start publishing: a later run is probed
+    # again rather than being written off.
+    unavailable_key = (model, run_date, forecast_hour)
+    if unavailable_key in _NATIVE_UNAVAILABLE:
+        return []
+
     # Cache is keyed the same way the isobaric fetch's is (model/run/lead,
     # not lat/lon) -- checked first so a run already on disk skips the
     # Herbie network probe entirely, same as the isobaric path below.
@@ -359,13 +406,16 @@ def _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon,
         h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
                   fxx=forecast_hour, verbose=False)
         if h.grib is None:
+            _NATIVE_UNAVAILABLE.add(unavailable_key)
             return []
 
         wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
         search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
         inventory = h.inventory(search=search)
         if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
-            return []  # missing more than expected -- treat as unavailable rather than guess
+            # missing more than expected -- treat as unavailable rather than guess
+            _NATIVE_UNAVAILABLE.add(unavailable_key)
+            return []
 
         def _fetch_one(row):
             start = int(row.start_byte)
@@ -471,19 +521,25 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     second point looked up for a run already on disk decodes straight
     from the cache file with no network access at all, and re-plotting
     the same point/run doesn't re-pull it either."""
-    latest_run = _latest_available_run(model, max_tries=max_tries)
+    # Case 1 pins the run outright, so it needs no idea what the latest
+    # run is -- and finding that out costs a series of network lookups
+    # (~5.5s measured), stepping back an hour at a time. Deferred into the
+    # branches that actually use it, which matters most for a batch: every
+    # site in a pinned run was paying for a lookup whose answer was thrown
+    # away.
     if run_datetime is not None:
         run_date = run_datetime.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         forecast_hour = forecast_hour if forecast_hour is not None else 0
         allow_retry = False
     elif forecast_hour is not None:
-        run_date = latest_run
+        run_date = _latest_available_run(model, max_tries=max_tries)
         allow_retry = False
     elif date is None:
-        run_date = latest_run
+        run_date = _latest_available_run(model, max_tries=max_tries)
         forecast_hour = 0
         allow_retry = False
     else:
+        latest_run = _latest_available_run(model, max_tries=max_tries)
         valid_time = date.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         if valid_time > latest_run:
             run_date = latest_run

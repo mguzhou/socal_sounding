@@ -32,6 +32,7 @@ from pathlib import Path
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import grib
 import Simple_Sounding
 
 logging.basicConfig(level=logging.INFO)
@@ -116,7 +117,13 @@ def _render(argv: list) -> Path:
             # only the last part means anything to someone in a chat.
             message = complaint[-1].split('error: ', 1)[-1] if complaint else 'invalid arguments'
             raise BadArguments(message) from None
-        stub = Simple_Sounding.main(args, output_dir=SCRIPT_DIR)
+        try:
+            stub = Simple_Sounding.main(args, output_dir=SCRIPT_DIR)
+        finally:
+            # The decoded-field memo pays off across sites in one batch;
+            # here each request is usually a different run, so it would
+            # just pin ~1 GB for the life of the service.
+            grib.clear_field_cache()
     return Path(f'{stub}.png')
 
 
