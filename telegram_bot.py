@@ -5,61 +5,192 @@ Usage (in a chat with the bot):
     /sounding 72572                -> latest sounding for station 72572
     /sounding NKX 2025-01-01T12    -> that station's sounding at that run
 
+    /sites                          -> list named sites (from sites.tsv)
+    /site Little Black              -> latest modeled sounding at that site
+    /site Little Black 2026-09-17T19 -> that site's sounding at that time
+
 Setup:
     export TELEGRAM_BOT_TOKEN="<token from @BotFather>"
     python telegram_bot.py
+
+Run it from this directory: Simple_Sounding is imported directly (not
+shelled out to), so it has to be importable, and its cache/ lives here.
 
 No chat ID is needed -- this replies wherever the command came from,
 it doesn't push anywhere on its own.
 """
 
+import asyncio
+import contextlib
+import io
 import logging
 import os
-import subprocess
-import sys
+import re
+import threading
 from pathlib import Path
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import Simple_Sounding
+
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request at INFO, and the Telegram API puts the bot
+# token in the URL path -- so at INFO the token gets written in clear
+# text to wherever this bot's output is redirected. Kept at WARNING so
+# a log file never becomes a credential leak.
+logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).parent
-SOUNDING_SCRIPT = SCRIPT_DIR / 'Simple_Sounding.py'
+SITES_FILE = SCRIPT_DIR.parent / 'sites.tsv'
+
+# matplotlib's pyplot is global, mutable state, so two renders must never
+# overlap -- concurrent requests queue here instead. Rendering in-process
+# rather than shelling out also means the caller is handed the exact
+# output path back, instead of having to guess at its own output by
+# picking the newest matching PNG off disk (which two overlapping
+# requests for the same site could get wrong).
+_render_lock = threading.Lock()
+
+
+def load_sites():
+    """Parse sites.tsv: one 'Name   lat   lon' per line, name and the two
+    floats separated by runs of whitespace (the name itself may contain
+    single spaces, e.g. "Little Black") -- same format/parsing as the
+    batch scripts (interesting2.sh's site list, run_batch_sites.py)."""
+    sites = []
+    if not SITES_FILE.exists():
+        return sites
+    with open(SITES_FILE) as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if not line.strip():
+                continue
+            m = re.match(r'^(.*?)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)$', line)
+            if m:
+                sites.append((m.group(1), float(m.group(2)), float(m.group(3))))
+    return sites
+
+
+def match_site(args):
+    """Match the longest possible prefix of args (joined with spaces,
+    case-insensitive) against a known site name, e.g. ['Little', 'Black',
+    '2026-09-17T19'] matches the two-word site "Little Black" and leaves
+    ['2026-09-17T19'] over for the datetime -- tried longest-first so a
+    multi-word site name isn't cut short by a plausible-looking prefix
+    match. Returns ((name, lat, lon), remaining_args), or (None, args) if
+    no prefix of args names a known site."""
+    sites = load_sites()
+    for n in range(len(args), 0, -1):
+        candidate = ' '.join(args[:n]).lower()
+        for name, lat, lon in sites:
+            if name.lower() == candidate:
+                return (name, lat, lon), args[n:]
+    return None, args
+
+
+class BadArguments(Exception):
+    """Arguments argparse refused, carrying its own complaint as text."""
+
+
+def _render(argv: list) -> Path:
+    """Blocking: build arguments from argv, render, return the PNG path.
+
+    Runs on a worker thread (see _render_and_reply) because the whole
+    fetch-and-plot is synchronous and slow enough -- seconds to minutes
+    on a cold GRIB2 fetch -- to stall the bot's event loop otherwise."""
+    with _render_lock:
+        # argparse reports bad input by printing to stderr and exiting,
+        # so the actual complaint ("Invalid date/time: ...") is only
+        # available by capturing that -- SystemExit itself carries just
+        # the exit status. Captured under the lock because redirecting
+        # stderr is process-wide.
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                args = Simple_Sounding.parse_args(argv)
+        except SystemExit:
+            complaint = stderr.getvalue().strip().splitlines()
+            # Last line is argparse's "<prog>: error: <what was wrong>";
+            # only the last part means anything to someone in a chat.
+            message = complaint[-1].split('error: ', 1)[-1] if complaint else 'invalid arguments'
+            raise BadArguments(message) from None
+        stub = Simple_Sounding.main(args, output_dir=SCRIPT_DIR)
+    return Path(f'{stub}.png')
+
+
+async def _render_and_reply(update: Update, argv: list, timeout: int, label: str) -> None:
+    """Shared plumbing for /sounding and /site: render in a worker
+    thread, then reply with the image or with whatever went wrong."""
+    await update.message.reply_text(f'Fetching {label} sounding...')
+
+    try:
+        png = await asyncio.wait_for(asyncio.to_thread(_render, argv), timeout)
+    except asyncio.TimeoutError:
+        # Only stops waiting -- the worker thread itself can't be
+        # cancelled, so it runs to completion and keeps the lock until
+        # then. Further requests queue rather than failing.
+        await update.message.reply_text('Timed out fetching/plotting that sounding.')
+        return
+    except BadArguments as e:
+        await update.message.reply_text(f'Bad arguments: {e}')
+        return
+    except Exception as e:
+        logger.exception('Sounding render failed')
+        await update.message.reply_text(f'Failed: {type(e).__name__}: {e}')
+        return
+
+    if not png.exists():
+        await update.message.reply_text('Ran, but no image was produced.')
+        return
+
+    with open(png, 'rb') as photo:
+        await update.message.reply_photo(photo)
 
 
 async def sounding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     station = args[0] if len(args) >= 1 else 'NKX'
-    cmd = [sys.executable, str(SOUNDING_SCRIPT), '--station', station]
+    argv = ['--station', station]
     if len(args) >= 2:
-        cmd += ['--datetime', args[1]]
+        argv += ['--datetime', args[1]]
 
-    await update.message.reply_text(f'Fetching {station} sounding...')
+    await _render_and_reply(update, argv, timeout=120, label=station)
 
-    try:
-        result = subprocess.run(cmd, cwd=SCRIPT_DIR, capture_output=True,
-                                text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        await update.message.reply_text('Timed out fetching/plotting that sounding.')
+
+async def site(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            'Usage: /site <name> [datetime]\nSee /sites for the list of names.')
         return
 
-    if result.returncode != 0:
-        error_line = result.stderr.strip().splitlines()[-1] if result.stderr else 'unknown error'
-        logger.warning('Simple_Sounding.py failed: %s', result.stderr)
-        await update.message.reply_text(f'Failed: {error_line}')
+    match, remaining = match_site(args)
+    if match is None:
+        await update.message.reply_text(
+            f'Unknown site {" ".join(args)!r}. See /sites for the list of names.')
         return
+    name, lat, lon = match
 
-    # Simple_Sounding.py names its output <station>_<run>.png in SCRIPT_DIR;
-    # the most recently modified matching file is the one just made.
-    png_files = sorted(SCRIPT_DIR.glob(f'{station}_*.png'), key=lambda f: f.stat().st_mtime)
-    if not png_files:
-        await update.message.reply_text('Ran, but no image was produced.')
+    argv = ['--lat', str(lat), '--lon', str(lon), '--name', name]
+    if remaining:
+        argv += ['--datetime', ' '.join(remaining)]
+
+    # A named site is a modeled (HRRR/RRFS/GFS) sounding, not the fast
+    # Wyoming CSV archive /sounding uses -- a cold fetch (no cached GRIB2
+    # run yet) can take several minutes, so this gets a much longer
+    # timeout than /sounding's.
+    await _render_and_reply(update, argv, timeout=600, label=name)
+
+
+async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sites = load_sites()
+    if not sites:
+        await update.message.reply_text('No named sites configured (sites.tsv not found or empty).')
         return
-
-    with open(png_files[-1], 'rb') as photo:
-        await update.message.reply_photo(photo)
+    lines = [name for name, lat, lon in sites]
+    await update.message.reply_text('Named sites:\n' + '\n'.join(lines))
 
 
 async def post_init(application: Application) -> None:
@@ -68,9 +199,11 @@ async def post_init(application: Application) -> None:
     # up. Uses the default scope, which covers both DMs and group chats
     # (the bot still needs to actually be a member of the group, and its
     # commands there may need "@YourBotUsername" if another bot in the
-    # same group also defines a /sounding command).
+    # same group also defines the same command name).
     await application.bot.set_my_commands([
         BotCommand('sounding', 'Skew-T sounding: /sounding [station] [datetime]'),
+        BotCommand('site', 'Named-site sounding: /site <name> [datetime]'),
+        BotCommand('sites', 'List named sites (from sites.tsv)'),
     ])
 
 
@@ -81,6 +214,8 @@ def main() -> None:
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler('sounding', sounding))
+    app.add_handler(CommandHandler('site', site))
+    app.add_handler(CommandHandler('sites', list_sites))
     logger.info('Bot starting (polling)...')
     app.run_polling()
 

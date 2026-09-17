@@ -1,0 +1,758 @@
+"""Modeled vertical profiles decoded straight from NOAA GRIB2 files
+(HRRR, RRFS), plus the URMA surface analysis.
+
+Herbie resolves which run/source exists and parses the .idx sidecar
+into byte ranges; the actual fetch and the eccodes decode are done
+here. See thredds.py for the THREDDS-based global fallback, which
+shares none of this machinery."""
+
+import math
+import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+import eccodes
+import metpy.calc as mpcalc
+import numpy as np
+import pandas as pd
+import requests
+from herbie import Herbie
+from metpy.units import units
+from requests.adapters import HTTPAdapter
+from scipy.spatial import cKDTree
+from urllib3.util.retry import Retry
+
+from config import CACHE_DIR
+
+
+###########################################
+# Modeled vertical profiles at an arbitrary lat/lon -- unlike the Wyoming
+# archive (real radiosonde launches, fixed station locations only), these
+# let the "sounding" be a gridded model's own analysis at any point, or
+# stand in for an observed comparison sounding at the same station.
+#
+# Priority order (best resolution first): HRRR (3km CONUS) -> RRFS (NOAA's
+# in-development HRRR successor) -> GFS (0.25 deg, global, coarser but
+# always available). Each fetcher takes (lat, lon, date) and returns
+# (dataframe, actual_valid_time) in the same schema fetch_recent_sounding
+# produces (pressure/height/temperature/dewpoint/direction/speed/
+# latitude/longitude), so everything downstream -- lapse rate, CCL,
+# plotting -- works unchanged regardless of the data's source.
+
+
+# 1000..400 mb, surface first. Top: the skew-T panel always caps its
+# y-axis at 6 km MSL regardless of station (see render_skewt_panel), and
+# 400 mb is comfortably above that (~7 km) in any real atmosphere, so
+# levels below it would only ever be fetched to be cropped out of the
+# plot. Bottom: 1000 mb is a hard ceiling, not a choice -- verified
+# against both models' actual inventories, neither HRRR's nor RRFS's
+# isobaric ("prslev"/wrfprs) product publishes anything below 1000 mb
+# (no 1025/1050 mb messages exist to fetch), so there's no isobaric
+# level available for surface pressure above 1000 mb (a ridge, or a
+# low-elevation/below-sea-level point) the way there would be for a
+# real radiosonde's own reported surface. Getting a genuine near-surface
+# point in that situation would need the separate 2m/10m diagnostic
+# fields (a different product/level string, plus the surface pressure
+# value itself to know what pressure to plot them at) -- not pursued.
+MODEL_PRESSURE_LEVELS = list(range(1000, 399, -25))
+HRRR_FETCH_WORKERS = 16
+
+
+def _lcc_cone_constant(latin1, latin2):
+    """Lambert Conformal Conic cone constant from the grid's standard
+    parallels -- HRRR uses a single tangent parallel (Latin1==Latin2), so
+    this falls back to sin(Latin1) rather than the general two-parallel
+    formula's 0/0."""
+    if abs(latin1 - latin2) < 1e-6:
+        return math.sin(math.radians(latin1))
+    return (math.log(math.cos(math.radians(latin1)) / math.cos(math.radians(latin2)))
+           / math.log(math.tan(math.radians(45 - latin1 / 2))
+                      / math.tan(math.radians(45 - latin2 / 2))))
+
+
+def _decode_grib_fields(grib_path, lat, lon):
+    """Decode a cached GRIB2 subset (from _fetch_grib_profile) into the
+    per-level {shortName: value} dict the caller needs, at the grid point
+    nearest (lat, lon).
+
+    eccodes' own codes_grib_find_nearest decodes a message's *entire*
+    field internally just to answer one point -- measured at ~60s of CPU
+    across a single RRFS run's ~125 messages on its ~1.9M-point North
+    America grid, and that cost repeats on every call even though the
+    field data is identical between calls for the same run (only the
+    query point differs). Decoding straight to full numpy arrays once
+    and caching them (compressed, alongside the raw GRIB2 subset)
+    instead means a second point looked up against an already-decoded
+    run costs a KDTree build (under a second, from the cached lat/lon
+    grid) and a query (sub-millisecond) rather than that same ~60s of
+    eccodes decode all over again -- and it's a bit faster even on the
+    very first point, since a plain values decode is itself faster than
+    find_nearest's own per-message overhead.
+
+    The grid's lat/lon and the LCC cone constant/central meridian only
+    need decoding once (identical for every message sharing a grid
+    definition, which every message in one of these subsets does) --
+    not once per level/variable."""
+    fields_path = grib_path.with_suffix('.fields.npz')
+    if fields_path.exists():
+        cached = np.load(fields_path)
+        lats, lons = cached['latitudes'], cached['longitudes']
+        cone, lov = float(cached['cone']), float(cached['lov'])
+        values = {k: cached[k] for k in cached.files if k not in ('latitudes', 'longitudes', 'cone', 'lov')}
+    else:
+        lats = lons = None
+        cone = lov = None
+        values = {}
+        with open(grib_path, 'rb') as f:
+            while True:
+                gid = eccodes.codes_grib_new_from_file(f)
+                if gid is None:
+                    break
+                short_name = eccodes.codes_get(gid, 'shortName')
+                level = eccodes.codes_get(gid, 'level')
+                if lats is None:
+                    lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
+                    lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
+                values[f'{short_name}_{level}'] = np.asarray(
+                    eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
+                # eccodes names the wind components by level type: plain
+                # u/v on isobaric and hybrid levels, but 10u/10v for the
+                # fixed 10 m diagnostic winds (URMA and the models' own
+                # surface products). Both are the same grid-relative
+                # components, and either one carries the projection
+                # metadata this needs.
+                if short_name in ('u', 'v', '10u', '10v') and cone is None:
+                    cone = _lcc_cone_constant(eccodes.codes_get(gid, 'Latin1InDegrees'),
+                                              eccodes.codes_get(gid, 'Latin2InDegrees'))
+                    lov = eccodes.codes_get(gid, 'LoVInDegrees')
+                eccodes.codes_release(gid)
+
+        # .part + rename so a run interrupted mid-write can't leave a
+        # truncated cache file that a later call mistakes for complete.
+        # np.savez_compressed auto-appends ".npz" to a string/Path target
+        # (which would turn ...npz.part into ...npz.part.npz and break
+        # the rename below) but not to an already-open file object.
+        tmp_path = fields_path.with_suffix('.npz.part')
+        with open(tmp_path, 'wb') as tmp:
+            np.savez_compressed(tmp, latitudes=lats, longitudes=lons,
+                                cone=np.float32(cone), lov=np.float32(lov), **values)
+        tmp_path.rename(fields_path)
+
+    tree = cKDTree(np.column_stack([lats, lons]))
+    # lons is in eccodes' 0-360 convention (see the longitude-normalizing
+    # comment below) -- query with the same convention, or a -180..180
+    # input like -117 reads as numerically far from every real point in
+    # the grid's 225-299 range and returns nonsense (caught by exactly
+    # this: an early version of this query, without the % 360, matched
+    # coastal British Columbia for a San Diego-area query point).
+    _, idx = tree.query([lat, lon % 360])
+    nearest_lat, nearest_lon = float(lats[idx]), float(lons[idx])
+
+    levels = {}
+    for key, arr in values.items():
+        short_name, level_str = key.rsplit('_', 1)
+        level = int(level_str)
+        entry = levels.setdefault(level, {})
+        entry[short_name] = float(arr[idx])
+        if short_name in ('u', 'v', '10u', '10v'):
+            entry['_lat'], entry['_lon'] = nearest_lat, nearest_lon
+    return levels, cone, lov
+
+
+def _latest_available_run(model, max_tries=6):
+    """The most recently posted run for an hourly model, found by
+    starting from the current hour and stepping back until Herbie finds
+    one -- posting typically lags real time by an hour or two."""
+    run_date = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    for _ in range(max_tries):
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs', fxx=0, verbose=False)
+        if h.grib is not None:
+            return run_date
+        run_date -= timedelta(hours=1)
+    raise RuntimeError(f'No recent {model.upper()} run found')
+
+
+# Product name for each model's surface/2D diagnostic fields (HGT:surface
+# -- terrain elevation -- among them). Different naming per model in
+# NOAA's own file layout: HRRR calls it "sfc", RRFS "2d".
+SURFACE_PRODUCT = {'hrrr': 'sfc', 'rrfs': '2d'}
+
+# Product name for each model's native (hybrid/sigma) vertical levels,
+# where available -- HRRR publishes these ("nat"); RRFS's own product
+# name is "natlev" but as of this writing 404s (its native-level product
+# doesn't appear to be populated yet, consistent with RRFS still being
+# early-operational) -- not hardcoded as HRRR-only, though, so RRFS picks
+# this up automatically the moment it does start publishing (see
+# _fetch_native_levels, which already treats "not found" as "skip these,
+# isobaric-only is all there is").
+NATIVE_LEVEL_PRODUCT = {'hrrr': 'nat', 'rrfs': 'natlev'}
+# How many of the near-surface native levels to pull -- level 15 was
+# ~3.5 km/667 mb in testing (HRRR, San Diego area), comfortably covering
+# the boundary-layer depth these plots actually care about (6 km MSL
+# cap), while levels 1-6 alone already pack into the same range the 25 mb
+# isobaric spacing only samples 2-3 times -- 2-3x the near-surface
+# resolution without pulling all 50 levels up into the stratosphere.
+MAX_NATIVE_LEVEL = 15
+
+
+def _fetch_terrain_height(model, lat, lon, max_tries=6):
+    """Terrain elevation (m) at the grid point nearest (lat, lon), from
+    the model's own orography (HGT:surface). Terrain is static for a
+    given model/grid -- it doesn't change run to run or with forecast
+    lead -- so this is cached once per model rather than once per run
+    the way the isobaric fields are."""
+    cache_path = CACHE_DIR / f'{model.upper()}_terrain.npz'
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        lats, lons, values = cached['latitudes'], cached['longitudes'], cached['values']
+    else:
+        run_date = _latest_available_run(model, max_tries=max_tries)
+        h = Herbie(run_date.replace(tzinfo=None), model=model,
+                  product=SURFACE_PRODUCT[model], fxx=0, verbose=False)
+        df = h.inventory(search=r':HGT:surface:')
+        row = df.iloc[0]
+        start = int(row.start_byte)
+        end = None if pd.isna(row.end_byte) else int(row.end_byte)
+        range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+        r = requests.get(h.grib, headers={'Range': range_hdr}, timeout=30)
+        r.raise_for_status()
+
+        fd, tmp_path = tempfile.mkstemp(suffix='.grib2')
+        try:
+            with open(fd, 'wb') as f:
+                f.write(r.content)
+            with open(tmp_path, 'rb') as f:
+                gid = eccodes.codes_grib_new_from_file(f)
+                lats = np.asarray(eccodes.codes_get_array(gid, 'latitudes'), dtype=np.float32)
+                lons = np.asarray(eccodes.codes_get_array(gid, 'longitudes'), dtype=np.float32)
+                values = np.asarray(eccodes.codes_get_array(gid, 'values'), dtype=np.float32)
+                eccodes.codes_release(gid)
+        finally:
+            os.unlink(tmp_path)
+
+        # .part + rename so a run interrupted mid-write can't leave a
+        # truncated cache file a later call mistakes for complete (see
+        # the matching pattern in _decode_grib_fields).
+        tmp_cache = cache_path.with_suffix('.npz.part')
+        with open(tmp_cache, 'wb') as f:
+            np.savez_compressed(f, latitudes=lats, longitudes=lons, values=values)
+        tmp_cache.rename(cache_path)
+
+    tree = cKDTree(np.column_stack([lats, lons]))
+    _, idx = tree.query([lat, lon % 360])
+    return float(values[idx])
+
+
+def _fetch_surface_row(model, cache_prefix, run_date, forecast_hour, lat, lon,
+                       terrain_height, session):
+    """The model's own surface diagnostics as one profile row (2 m
+    temperature/dewpoint, 10 m wind, surface pressure), or None if this
+    model/run doesn't publish them.
+
+    Without this the lowest row of a modeled profile is whichever
+    *isobaric* level survives the terrain trim, and a surface parcel gets
+    launched from there. That is fine where native levels reach nearly to
+    the ground (HRRR's level 1 measured ~11 m AGL) but badly wrong
+    otherwise: RRFS publishes no native levels, so its lowest retained
+    level measured 150-230 m AGL across these sites, and its 2 m
+    temperature ran 3.6-4.6 degC warmer than the air up there. Launching
+    a "surface" parcel from 200 m up discards exactly the superadiabatic
+    layer that drives a thermal, and it starts the parcel neutral with
+    its environment by construction -- both of which make the model look
+    like it under-forecasts surface heating when it doesn't.
+
+    So this is fetched for every model rather than only the ones missing
+    native levels: it is what "surface" should have meant all along, and
+    it removes the model-to-model asymmetry in what the parcel starts
+    from. Same product the terrain height comes from, but keyed per
+    run/lead rather than cached once, since these fields do vary."""
+    product = SURFACE_PRODUCT.get(model)
+    if product is None:
+        return None
+
+    cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.surface.grib2'
+    if not cache_path.exists():
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
+                   fxx=forecast_hour, verbose=False)
+        if h.grib is None:
+            return None
+
+        search = (r':(?:TMP|DPT):2 m above ground:'
+                  r'|:(?:UGRD|VGRD):10 m above ground:'
+                  r'|:PRES:surface:')
+        inventory = h.inventory(search=search)
+        if len(inventory) < 5:
+            return None
+
+        def _fetch_one(row):
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
+            r.raise_for_status()
+            return r.content
+
+        tmp_path = cache_path.with_suffix('.grib2.part')
+        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+            with open(tmp_path, 'wb') as tmp:
+                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                    tmp.write(content)
+        tmp_path.rename(cache_path)
+
+    levels, cone, lov = _decode_grib_fields(cache_path, lat, lon)
+    # eccodes names the height-tagged diagnostics by their level rather
+    # than plainly: 2t/2d at 2 m, 10u/10v at 10 m, sp for surface
+    # pressure -- not t/dpt/u/v/pres. Verified against both models.
+    surface, two_m, ten_m = levels.get(0, {}), levels.get(2, {}), levels.get(10, {})
+    if not ('sp' in surface and {'2t', '2d'} <= two_m.keys() and {'10u', '10v'} <= ten_m.keys()):
+        return None
+
+    diff = ((ten_m['_lon'] - lov + 180) % 360) - 180
+    angle = math.radians(cone * diff)
+    u_earth = ten_m['10v'] * math.sin(angle) + ten_m['10u'] * math.cos(angle)
+    v_earth = ten_m['10v'] * math.cos(angle) - ten_m['10u'] * math.sin(angle)
+
+    return {
+        'pressure': surface['sp'] / 100.,  # Pa -> hPa, station (not sea-level) pressure
+        # The temperature/dewpoint here are valid at 2 m, so that is where
+        # the row sits; the 10 m wind is reported at the same row rather
+        # than given one of its own, the way a radiosonde's surface entry
+        # carries the whole surface observation at one height.
+        'height': terrain_height + 2.,
+        'temperature': two_m['2t'] - 273.15,
+        'dewpoint': two_m['2d'] - 273.15,
+        'speed': math.hypot(u_earth, v_earth) * 1.9438445,  # m/s -> kt
+        'direction': math.degrees(math.atan2(-u_earth, -v_earth)) % 360,
+        'latitude': ten_m['_lat'],
+        'longitude': ((ten_m['_lon'] + 180) % 360) - 180,
+    }
+
+
+def _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon, session):
+    """Extra near-surface rows (same shape as _fetch_grib_profile's own
+    row dicts) from the model's native/hybrid levels 1..MAX_NATIVE_LEVEL,
+    or an empty list if this model/run doesn't publish them (e.g. RRFS,
+    as of this writing) -- callers merge these in alongside the regular
+    isobaric levels rather than depending on them.
+
+    Native levels don't sit at round pressures the way isobaric levels
+    do, but each one reports its own actual pressure directly (a PRES
+    field per level) -- no hybrid sigma-pressure coefficient math
+    needed, just read it like any other per-level variable. Humidity
+    here is specific humidity (SPFH, kg/kg), not dewpoint directly, so
+    it needs converting via mpcalc.dewpoint_from_specific_humidity.
+
+    Uses the given run_date/forecast_hour as-is (no retry/resolution of
+    its own) -- these levels only make sense paired with the exact same
+    run already resolved for the isobaric fetch, not independently
+    re-resolved."""
+    product = NATIVE_LEVEL_PRODUCT.get(model)
+    if product is None:
+        return []
+
+    # Cache is keyed the same way the isobaric fetch's is (model/run/lead,
+    # not lat/lon) -- checked first so a run already on disk skips the
+    # Herbie network probe entirely, same as the isobaric path below.
+    cache_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.native.grib2'
+    if not cache_path.exists():
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product=product,
+                  fxx=forecast_hour, verbose=False)
+        if h.grib is None:
+            return []
+
+        wanted_levels = '|'.join(str(lvl) for lvl in range(1, MAX_NATIVE_LEVEL + 1))
+        search = rf':(?:PRES|HGT|TMP|SPFH|UGRD|VGRD):(?:{wanted_levels}) hybrid level:'
+        inventory = h.inventory(search=search)
+        if len(inventory) < MAX_NATIVE_LEVEL * 6 * 0.9:
+            return []  # missing more than expected -- treat as unavailable rather than guess
+
+        def _fetch_one(row):
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=30)
+            r.raise_for_status()
+            return r.content
+
+        tmp_path = cache_path.with_suffix('.grib2.part')
+        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+            with open(tmp_path, 'wb') as tmp:
+                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                    tmp.write(content)
+        tmp_path.rename(cache_path)
+
+    levels, cone, lov = _decode_grib_fields(cache_path, lat, lon)
+
+    rows = []
+    for lvl in levels:
+        d = levels[lvl]
+        if not all(k in d for k in ('pres', 't', 'q', 'gh', 'u', 'v')):
+            continue
+        pressure_hpa = d['pres'] / 100.  # Pa -> hPa
+        dewpoint_c = mpcalc.dewpoint_from_specific_humidity(
+            units.Quantity(pressure_hpa, 'hPa'), units.Quantity(d['q'], 'kg/kg')).m
+        diff = ((d['_lon'] - lov + 180) % 360) - 180
+        angle = math.radians(cone * diff)
+        u_earth = d['v'] * math.sin(angle) + d['u'] * math.cos(angle)
+        v_earth = d['v'] * math.cos(angle) - d['u'] * math.sin(angle)
+        rows.append({
+            'pressure': pressure_hpa,
+            'height': d['gh'],
+            'temperature': d['t'] - 273.15,
+            'dewpoint': dewpoint_c,
+            'speed': math.hypot(u_earth, v_earth) * 1.9438445,
+            'direction': math.degrees(math.atan2(-u_earth, -v_earth)) % 360,
+            'latitude': d['_lat'],
+            'longitude': ((d['_lon'] + 180) % 360) - 180,
+        })
+    return rows
+
+
+def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
+                        run_datetime=None, max_tries=6):
+    """Modeled vertical profile at the nearest grid point of a CONUS,
+    Lambert-Conformal, hourly GRIB2 model (HRRR or RRFS), pulled from
+    NOAA's public AWS archive.
+
+    Herbie (the herbie-data package) resolves which model/source/run
+    actually exists and parses the run's .idx sidecar into byte ranges
+    for the requested variables/levels -- it knows the current URL
+    templates and source fallbacks (AWS/NOMADS/etc.) for a large model
+    registry, including RRFS's now-operational feed, so this doesn't
+    hardcode any of that. But Herbie's own .download() fetches matched
+    byte ranges one at a time; for a request this wide (~125 messages,
+    before trimming to fewer levels this was ~195) that took over 10
+    minutes in testing. So Herbie is used only to resolve the run and
+    its byte ranges (.inventory()) -- the actual fetch below is a
+    parallel ThreadPoolExecutor pull instead.
+
+    Each message is decoded with eccodes and reduced to its single
+    nearest grid point immediately (eccodes' own nearest-neighbor
+    search), so the full 2D field is never materialized.
+
+    These models' u/v wind components are *grid-relative* (Lambert
+    Conformal), not earth-relative -- plotted or converted to direction
+    without correction, they'd point the wrong way except exactly on the
+    grid's central meridian. They're rotated to true north here using
+    the standard LCC formula, with the cone constant and central
+    meridian read from the grid's own GRIB2 metadata rather than
+    hardcoded, so this isn't tied to any one model's specific projection
+    parameters.
+
+    Four ways to pick a run + forecast lead, checked in this order:
+
+    1. run_datetime given: pins the exact run init time (no fallback --
+       raises if that hour wasn't actually posted, rather than silently
+       stepping to a different run than the one asked for). forecast_hour
+       defaults to 0 (that run's own analysis) unless also given.
+    2. forecast_hour given (without run_datetime): the latest available
+       run, at that explicit lead -- e.g. "the latest run's 6-hour
+       forecast," without caring what valid time that lands on.
+    3. date=None (neither of the above given either): the latest run
+       available, as-is (forecast_hour 0) -- the default whenever the
+       caller hasn't asked for a specific time.
+    4. date given: treated as the desired *valid* time, not necessarily a
+       run's own init time -- if it's still in the future (e.g. "local
+       noon" requested before noon has actually happened), there's no run
+       initialized then, so the freshest run actually posted is used
+       instead, with whatever forecast lead lands on the requested valid
+       time, rather than silently falling back to an earlier analysis and
+       mislabeling it. If it's now or in the past, the run at/before it is
+       used directly (forecast_hour 0), stepping back an hour at a time if
+       that exact hour isn't posted (or is older than the archive's
+       start) -- this is the one case that steps back at all, since
+       pinning either the run or the lead explicitly (1-2) means stepping
+       would silently change what was asked for.
+
+    The assembled GRIB2 subset (all requested messages for one run, on
+    the order of 80 MB) is cached under CACHE_DIR the same way Wyoming
+    soundings are -- it's the same data regardless of (lat, lon), so a
+    second point looked up for a run already on disk decodes straight
+    from the cache file with no network access at all, and re-plotting
+    the same point/run doesn't re-pull it either."""
+    latest_run = _latest_available_run(model, max_tries=max_tries)
+    if run_datetime is not None:
+        run_date = run_datetime.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        forecast_hour = forecast_hour if forecast_hour is not None else 0
+        allow_retry = False
+    elif forecast_hour is not None:
+        run_date = latest_run
+        allow_retry = False
+    elif date is None:
+        run_date = latest_run
+        forecast_hour = 0
+        allow_retry = False
+    else:
+        valid_time = date.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        if valid_time > latest_run:
+            run_date = latest_run
+            forecast_hour = round((valid_time - run_date).total_seconds() / 3600)
+            allow_retry = False  # a fixed (run, lead) pair -- stepping the run back would change the valid time
+        else:
+            run_date = valid_time
+            forecast_hour = 0
+            allow_retry = True
+
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=HRRR_FETCH_WORKERS,
+                          pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
+    session.mount('https://', adapter)
+
+    wanted_levels = '|'.join(str(lvl) for lvl in MODEL_PRESSURE_LEVELS)
+    search = rf':(?:HGT|TMP|DPT|UGRD|VGRD):(?:{wanted_levels}) mb:'
+
+    grib_path = None
+    for _ in range(max_tries if allow_retry else 1):
+        candidate_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.grib2'
+        if candidate_path.exists():
+            grib_path = candidate_path
+            break
+
+        h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
+                  fxx=forecast_hour, verbose=False)
+        if h.grib is None:
+            if not allow_retry:
+                raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
+                                   f'f{forecast_hour:02d} forecast')
+            run_date -= timedelta(hours=1)
+            continue
+        url = h.grib
+
+        inventory = h.inventory(search=search)
+        if len(inventory) < len(MODEL_PRESSURE_LEVELS) * 5 * 0.9:
+            raise RuntimeError(f'{model.upper()} index missing expected messages for {run_date}')
+
+        def _fetch_one(row):
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = session.get(url, headers={'Range': range_hdr}, timeout=30)
+            r.raise_for_status()
+            return r.content
+
+        # Written to a .part path and renamed only once complete, so a
+        # run interrupted mid-fetch can't leave a truncated file that a
+        # later call mistakes for a valid, complete cache entry.
+        tmp_path = candidate_path.with_suffix('.grib2.part')
+        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+            with open(tmp_path, 'wb') as tmp:
+                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                    tmp.write(content)
+        tmp_path.rename(candidate_path)
+        grib_path = candidate_path
+        break
+    else:
+        raise RuntimeError(f'No {model.upper()} run found near {date}')
+
+    levels, cone, lov = _decode_grib_fields(grib_path, lat, lon)
+
+    rows = []
+    for lvl in sorted(levels, reverse=True):
+        d = levels[lvl]
+        if not all(k in d for k in ('t', 'dpt', 'gh', 'u', 'v')):
+            continue  # a level missing a variable (shouldn't happen) -- skip rather than fake it
+        diff = ((d['_lon'] - lov + 180) % 360) - 180
+        angle = math.radians(cone * diff)
+        u_earth = d['v'] * math.sin(angle) + d['u'] * math.cos(angle)
+        v_earth = d['v'] * math.cos(angle) - d['u'] * math.sin(angle)
+        rows.append({
+            'pressure': lvl,
+            'height': d['gh'],
+            'temperature': d['t'] - 273.15,
+            'dewpoint': d['dpt'] - 273.15,
+            'speed': math.hypot(u_earth, v_earth) * 1.9438445,  # m/s -> kt
+            'direction': math.degrees(math.atan2(-u_earth, -v_earth)) % 360,
+            'latitude': d['_lat'],
+            # eccodes reports HRRR/RRFS grid-point longitudes in 0-360
+            # convention -- normalize to -180..180 to match what
+            # Open-Meteo/geocoding/everything else downstream expects.
+            'longitude': ((d['_lon'] + 180) % 360) - 180,
+        })
+
+    # Native/hybrid levels give much finer near-surface resolution than
+    # the 25 mb isobaric spacing above (e.g. HRRR's lowest ~15 native
+    # levels span roughly the same range as the isobaric grid's bottom
+    # 2-3 levels). Merged in here when the model actually publishes them
+    # -- RRFS's equivalent product doesn't exist yet, so this is
+    # currently a no-op there (see _fetch_native_levels) and will pick
+    # it up automatically once it is.
+    rows += _fetch_native_levels(model, cache_prefix, run_date, forecast_hour, lat, lon, session)
+    rows.sort(key=lambda row: row['pressure'], reverse=True)
+
+    # Isobaric (fixed-pressure) fields are computed everywhere on the
+    # grid regardless of terrain -- where a pressure surface would fall
+    # below actual ground, NOAA's post-processing extrapolates a value
+    # with a standard lapse rate rather than reporting no data. Verified
+    # directly against this field: Palomar (~673 m terrain) had its
+    # 1000/975/950 mb isobaric heights (126/348/575 m) all below its own
+    # ground. Dropping levels below the grid's own terrain height here
+    # (native levels included) keeps the plotted profile starting at
+    # real atmosphere, the same way a radiosonde's own lowest reported
+    # level is real ground.
+    terrain_height = _fetch_terrain_height(model, lat, lon)
+    rows = [row for row in rows if row['height'] >= terrain_height]
+
+    # The model's own surface diagnostics, as the profile's ground row --
+    # see _fetch_surface_row for why a parcel launched from the lowest
+    # *isobaric* level isn't a surface parcel at all. Everything at or
+    # above its pressure is dropped so the profile keeps a single,
+    # unambiguous bottom: a retained isobaric level sitting essentially
+    # at ground would otherwise duplicate this row's pressure, and
+    # several things downstream (the MSL height mapping, the lapse-rate
+    # window) need pressure to be a strictly decreasing coordinate.
+    surface_row = _fetch_surface_row(model, cache_prefix, run_date, forecast_hour,
+                                     lat, lon, terrain_height, session)
+    if surface_row is not None:
+        rows = [row for row in rows if row['pressure'] < surface_row['pressure']]
+        rows.insert(0, surface_row)
+
+    if not rows:
+        raise RuntimeError(f'No usable {model.upper()} levels decoded for {run_date}')
+    # valid_time is "the sounding's time" for titles/labels/filenames;
+    # run_date is when the underlying model was actually run, which
+    # differs from it whenever forecast_hour > 0 -- both are returned so
+    # the caller can show which run a forecast came from.
+    return pd.DataFrame(rows), run_date + timedelta(hours=forecast_hour), run_date
+
+
+def fetch_hrrr_profile(lat, lon, date, forecast_hour=None, run_datetime=None, max_tries=6):
+    """Modeled vertical profile at the nearest HRRR (3km CONUS) grid
+    point. See _fetch_grib_profile for how the fetch actually works."""
+    return _fetch_grib_profile(lat, lon, date, model='hrrr', cache_prefix='HRRR',
+                               forecast_hour=forecast_hour, run_datetime=run_datetime,
+                               max_tries=max_tries)
+
+
+def fetch_rrfs_profile(lat, lon, date, forecast_hour=None, run_datetime=None, max_tries=6):
+    """Modeled vertical profile at the nearest RRFS (3km CONUS) grid
+    point -- NOAA's next-generation HRRR/RAP successor, now operational
+    on noaa-rrfs-ops-pds (found via Herbie's model registry; an earlier,
+    now-superseded RRFS bucket, noaa-rrfs-pds, holds only retrospective
+    test-case archives and isn't used here). See _fetch_grib_profile for
+    how the fetch actually works."""
+    return _fetch_grib_profile(lat, lon, date, model='rrfs', cache_prefix='RRFS',
+                               forecast_hour=forecast_hour, run_datetime=run_datetime,
+                               max_tries=max_tries)
+
+
+def fetch_urma_surface(lat, lon, date=None, max_tries=12):
+    """Analyzed *surface* conditions at the 2.5 km grid point nearest
+    (lat, lon), from URMA (Un-Restricted Mesoscale Analysis).
+
+    Not a profile source, and deliberately absent from MODEL_FETCHERS /
+    MODEL_PRIORITY below: URMA is a two-dimensional analysis (its files
+    are named "2dvaranl" -- 2-D variational analysis) with no isobaric
+    and no native levels. Its entire CONUS file is 14 messages, all of
+    them surface, 2 m or 10 m, so there is nothing to build a sounding
+    out of. Verified directly against the run's .idx sidecar.
+
+    What it is good for, and why it's here: unlike HRRR/RRFS/GFS, which
+    are forecasts, URMA assimilates surface observations -- so its 2 m
+    temperature and dewpoint are an analysis of what actually happened,
+    at 2.5 km rather than 3 km. Those are exactly the two values a
+    surface parcel is launched from, which makes this a way to anchor or
+    verify a modeled sounding's surface parcel against observations
+    instead of trusting the model's own lowest level.
+
+    Two limits that rule it out as a forecast source. It is analysis-only
+    (the template's "ges" product is the first-guess field, not a
+    forecast), so it can never cover a future valid time -- only now or
+    the past. And it posts with a deliberate multi-hour lag, which is the
+    point of URMA over RTMA: it waits for late-arriving observations.
+    date=None therefore means "the most recent analysis actually posted",
+    found by stepping back an hour at a time from now.
+
+    Returns a dict of the analysis at that point:
+        run_time, latitude, longitude (the grid point's own, not the
+        query's), terrain_height (m), pressure (hPa, station pressure --
+        NOT reduced to sea level), temperature/dewpoint (degC, 2 m),
+        speed (kt) and direction (deg, 10 m).
+    """
+    run_date = (date or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0)
+
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=HRRR_FETCH_WORKERS,
+                          pool_maxsize=HRRR_FETCH_WORKERS, max_retries=retry)
+    session.mount('https://', adapter)
+
+    # UGRD/VGRD rather than the WIND/WDIR the same file also carries,
+    # even though those are earth-relative and would need no rotation:
+    # _decode_grib_fields reads the LCC cone constant/central meridian
+    # (and tags the matched grid point) off the u/v messages specifically,
+    # so a subset without them decodes to cone=lov=None and fails on save.
+    search = (r':(?:HGT|PRES):surface:|:(?:TMP|DPT):2 m above ground:'
+              r'|:(?:UGRD|VGRD):10 m above ground:')
+
+    grib_path = None
+    for _ in range(max_tries):
+        candidate_path = CACHE_DIR / f'URMA_{run_date:%Y%m%d_%HZ}.grib2'
+        if candidate_path.exists():
+            grib_path = candidate_path
+            break
+
+        h = Herbie(run_date.replace(tzinfo=None), model='urma', product='anl',
+                   fxx=0, verbose=False)
+        if h.grib is None:
+            run_date -= timedelta(hours=1)
+            continue
+
+        inventory = h.inventory(search=search)
+        if len(inventory) < 6:
+            run_date -= timedelta(hours=1)
+            continue
+
+        def _fetch_one(row):
+            start = int(row.start_byte)
+            end = None if pd.isna(row.end_byte) else int(row.end_byte)
+            range_hdr = f'bytes={start}-{end}' if end is not None else f'bytes={start}-'
+            r = session.get(h.grib, headers={'Range': range_hdr}, timeout=60)
+            r.raise_for_status()
+            return r.content
+
+        tmp_path = candidate_path.with_suffix('.grib2.part')
+        with ThreadPoolExecutor(max_workers=HRRR_FETCH_WORKERS) as ex:
+            with open(tmp_path, 'wb') as tmp:
+                for content in ex.map(_fetch_one, (row for _, row in inventory.iterrows())):
+                    tmp.write(content)
+        tmp_path.rename(candidate_path)
+        grib_path = candidate_path
+        break
+    else:
+        raise RuntimeError(f'No URMA analysis found near {run_date:%Y-%m-%d %HZ}')
+
+    levels, cone, lov = _decode_grib_fields(grib_path, lat, lon)
+
+    # Keyed by level number, so: 0 = surface (orog/sp), 2 = the 2 m
+    # fields, 10 = the 10 m winds. These shortNames are not the ones the
+    # isobaric/native code uses -- eccodes names the height-tagged
+    # diagnostics 2t/2d/10u/10v and surface orography/pressure orog/sp,
+    # rather than t/dpt/u/v/gh. Checked against the actual messages.
+    surface, two_m, ten_m = levels.get(0, {}), levels.get(2, {}), levels.get(10, {})
+    u_name = '10u' if '10u' in ten_m else 'u'
+    v_name = '10v' if '10v' in ten_m else 'v'
+    missing = ([k for k in ('orog', 'sp') if k not in surface]
+               + [k for k in ('2t', '2d') if k not in two_m]
+               + [k for k in (u_name, v_name) if k not in ten_m])
+    if missing:
+        raise RuntimeError(f'URMA analysis {run_date:%Y-%m-%d %HZ} missing {missing}')
+
+    diff = ((ten_m['_lon'] - lov + 180) % 360) - 180
+    angle = math.radians(cone * diff)
+    u_earth = ten_m[v_name] * math.sin(angle) + ten_m[u_name] * math.cos(angle)
+    v_earth = ten_m[v_name] * math.cos(angle) - ten_m[u_name] * math.sin(angle)
+
+    return {
+        'run_time': run_date,
+        'latitude': ten_m['_lat'],
+        'longitude': ((ten_m['_lon'] + 180) % 360) - 180,
+        'terrain_height': surface['orog'],
+        'pressure': surface['sp'] / 100.,  # Pa -> hPa
+        'temperature': two_m['2t'] - 273.15,
+        'dewpoint': two_m['2d'] - 273.15,
+        'speed': math.hypot(u_earth, v_earth) * 1.9438445,  # m/s -> kt
+        'direction': math.degrees(math.atan2(-u_earth, -v_earth)) % 360,
+    }
