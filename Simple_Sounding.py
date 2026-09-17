@@ -22,6 +22,18 @@ import matplotlib
 # Telegram bot imports this module directly. Switch this to 'QtAgg' if you
 # re-enable plt.show() and want an interactive window.
 matplotlib.use('Agg')
+
+# Fira Sans for all plot text, with matplotlib's bundled DejaVu Sans kept
+# behind it as a per-glyph fallback for anything Fira lacks.
+#
+# It has to be font.family, and it has to be a list: only that form builds
+# a real fallback chain. Setting font.sans-serif to the same list does NOT
+# -- that one is first-match-wins, so a glyph missing from the first font
+# renders as a blank box even when a later entry has it. Nor does either
+# list reach out to the rest of the system's fonts; only what is named
+# here is ever consulted.
+matplotlib.rcParams['font.family'] = ['Fira Sans', 'DejaVu Sans']
+
 # Set before any project module pulls in pyplot, which the imports
 # below do -- so this stays above them.
 import matplotlib.pyplot as plt

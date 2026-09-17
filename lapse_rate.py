@@ -126,7 +126,7 @@ def render_lapse_rate_panel(fig, subplot, sounding_df, skew_ax, compare_sounding
 
     ax.axvline(0, color='grey', linestyle='solid', linewidth=1, alpha=0.6)
     ax.axvline(9.8, color='grey', linestyle='solid', linewidth=1, alpha=0.6)
-    ax.set_xlabel('Lapse rate (\N{DEGREE CELSIUS}/km)')
+    ax.set_xlabel('Lapse rate (\N{DEGREE SIGN}C/km)')
     ax.set_xlim(-4, 14)
 
     if parcel_p is not None:
@@ -141,7 +141,7 @@ def render_lapse_rate_panel(fig, subplot, sounding_df, skew_ax, compare_sounding
         ax2.set_xlim(-0.2, 1.2)
 
         ax2.axvline(0, color='Crimson', linestyle='dotted', linewidth=1, alpha=0.6)
-        ax2.set_xlabel('Parcel \N{MINUS SIGN} environment (\N{DEGREE CELSIUS})', color='Black')
+        ax2.set_xlabel('Parcel \N{MINUS SIGN} environment (\N{DEGREE SIGN}C)', color='Black')
         ax2.tick_params(axis='x')
         handles = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
         labels = ax.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]

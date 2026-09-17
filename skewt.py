@@ -143,7 +143,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz_offset, tz_a
     skew.plot(p, median_filter(Td.m, size=5, mode='nearest') * units.degC, 'g')
 
     skew.ax.axvline(0, color='grey', linestyle='solid', linewidth=1.3, alpha=0.8)
-    skew.ax.set_xlabel('Temperature (\N{DEGREE CELSIUS})')
+    skew.ax.set_xlabel('Temperature (\N{DEGREE SIGN}C)')
 
     # Set spacing interval--Every 10 mb from 1000 to 100 mb
     my_interval = np.arange(500, 1010, 10) * units('mbar')
@@ -226,7 +226,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz_offset, tz_a
             p, units.Quantity(base_temp + forecast_uncertainty, 'degC'), Td[0]).to('degC')
         skew.plot(p, forecast_profile, color='black', linewidth=1.2, linestyle='solid',
                  label=f'{parcel_label} parcel ({base_temp:.1f} \N{PLUS-MINUS SIGN} '
-                       f'{forecast_uncertainty:.1f}) \N{DEGREE CELSIUS}{parcel_suffix}')
+                       f'{forecast_uncertainty:.1f}) \N{DEGREE SIGN}C{parcel_suffix}')
 
         # Lifted condensation level for that same parcel -- marks where
         # it would saturate, i.e. the base of any clouds that heating to
@@ -275,7 +275,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz_offset, tz_a
         conv_path_temp = mpcalc.dry_lapse(conv_path_pressure, convective_temp).to('degC')
         skew.plot(conv_path_pressure, conv_path_temp, color='darkorange', linewidth=1.2,
                  linestyle='solid', alpha=0.8,
-                 label=f'Convective temperature ({convective_temp.m:.1f}\N{DEGREE CELSIUS})')
+                 label=f'Convective temperature ({convective_temp.m:.1f}\N{DEGREE SIGN}C)')
 
         # The mixing line (constant mixing ratio) from the surface dewpoint
         # up to the higher of the LCL/CCL -- the classic graphical
