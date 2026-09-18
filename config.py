@@ -8,18 +8,22 @@ from datetime import timedelta
 from pathlib import Path
 
 
-def gmt_offset_label(dt):
-    """'GMT-7' for an aware datetime's own UTC offset, to sit in front of
-    the zone's abbreviation in a title ("14:00 GMT-7 PDT").
+def utc_offset_label(dt):
+    """'UTC-7' for an aware datetime's own offset, to sit alongside the
+    zone's abbreviation in a title ("14:00 PDT (UTC-7)").
+
+    UTC rather than GMT deliberately: GMT is a time zone in its own
+    right, while what this prints is an offset from UTC -- which is what
+    utcoffset() returns and what aviation and weather products use.
 
     Taken from the datetime rather than the zone, so it reports the
     offset in force on *that* date rather than today's -- the whole point
     of converting through a real timezone. Half-hour and quarter-hour
-    zones come out as 'GMT+5:30' / 'GMT+5:45'."""
+    zones come out as 'UTC+5:30' / 'UTC+5:45'."""
     total_minutes = int((dt.utcoffset() or timedelta(0)).total_seconds()) // 60
     sign = '-' if total_minutes < 0 else '+'
     hours, minutes = divmod(abs(total_minutes), 60)
-    return f'GMT{sign}{hours}' + (f':{minutes:02d}' if minutes else '')
+    return f'UTC{sign}{hours}' + (f':{minutes:02d}' if minutes else '')
 
 
 # Priority order for modeled (arbitrary lat/lon) profiles -- RRFS first

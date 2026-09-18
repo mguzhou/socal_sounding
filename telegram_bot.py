@@ -22,6 +22,8 @@ it doesn't push anywhere on its own.
 
 import asyncio
 import contextlib
+import ctypes
+import ctypes.util
 import io
 import logging
 import os
@@ -53,6 +55,26 @@ SITES_FILE = SCRIPT_DIR.parent / 'sites.tsv'
 # picking the newest matching PNG off disk (which two overlapping
 # requests for the same site could get wrong).
 _render_lock = threading.Lock()
+
+
+def _release_freed_memory():
+    """Hand memory the allocator is holding back to the OS.
+
+    Freeing a ~950 MB run's field arrays returns them to glibc, which
+    keeps them on its own free lists rather than to the kernel -- so RSS
+    stays high and a long-lived service looks like it is leaking when it
+    isn't. malloc_trim releases what it can. Paired with MALLOC_ARENA_MAX
+    in the systemd unit, which stops the fetch pool's threads each
+    building their own arena in the first place.
+
+    glibc-specific: absent on macOS, hence the getattr guard."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c'))
+        trim = getattr(libc, 'malloc_trim', None)
+        if trim is not None:
+            trim(0)
+    except OSError:
+        pass
 
 
 def load_sites():
@@ -124,6 +146,7 @@ def _render(argv: list) -> Path:
             # here each request is usually a different run, so it would
             # just pin ~1 GB for the life of the service.
             grib.clear_field_cache()
+            _release_freed_memory()
     return Path(f'{stub}.png')
 
 

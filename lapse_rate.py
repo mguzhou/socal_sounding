@@ -138,7 +138,7 @@ def render_lapse_rate_panel(fig, subplot, sounding_df, skew_ax, compare_sounding
         delta_T = parcel_profile.m - parcel_env_T.m
         ax2.plot(delta_T, parcel_p.m, color='crimson', linewidth=1.2,
                 label='Parcel \N{MINUS SIGN} environment')
-        ax2.set_xlim(-0.2, 1.2)
+        ax2.set_xlim(-0.8, 2.8)
 
         ax2.axvline(0, color='Crimson', linestyle='dotted', linewidth=1, alpha=0.6)
         ax2.set_xlabel('Parcel \N{MINUS SIGN} environment (\N{DEGREE SIGN}C)', color='Black')

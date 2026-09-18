@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# All sites.tsv sites, pinned to the exact run we've been using: RRFS's
-# 2026-09-16 12Z cycle, 31h forecast lead (valid 2026-09-17 19Z = noon
-# GMT-7 the next day). --run-datetime/--forecast-hour pin the run/lead
-# directly rather than resolving them from a valid time, so this stays
-# reproducible even once that run has aged out of RRFS's own rolling
-# archive from "latest available" resolution.
+# All sites.tsv sites at one valid time: 2026-09-19 19Z, noon UTC-7.
+#
+# --datetime asks for a *valid* time and lets the fetch resolve which run
+# and lead reach it -- normally the freshest run posted. Where that run
+# doesn't go out far enough (these models only run to a long lead on
+# their 00/06/12/18Z cycles), it falls back to older runs at a longer
+# lead until one covers this time, so the plot may come from an earlier
+# run than the newest available. The "Model run:" label says which.
+#
+# No --model on purpose: pinning the chain to one source means a valid
+# time no run of that model can reach fails outright, instead of falling
+# back to HRRR and then GFS.
 sites=(
     "Little Black|32.987952027309035|-117.12235348316403"
     "Torrey Pines|32.890234820022194|-117.25180563384053"
@@ -26,6 +32,6 @@ sites=(
 
 for entry in "${sites[@]}"; do
     IFS='|' read -r name lat lon <<< "$entry"
-    python Simple_Sounding.py --lat "$lat" --lon "$lon" --model rrfs \
-        --datetime "2026-09-17T19" --name "$name"
+    python Simple_Sounding.py --lat "$lat" --lon "$lon" \
+        --datetime "2026-09-19T19" --name "$name"
 done

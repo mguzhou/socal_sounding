@@ -8,7 +8,7 @@ from metpy.plots import SkewT
 from metpy.units import units
 from scipy.ndimage import median_filter
 
-from config import DEFAULT_ALTITUDE_UNIT, KM_TO_KFT, gmt_offset_label
+from config import DEFAULT_ALTITUDE_UNIT, KM_TO_KFT, utc_offset_label
 # The skew-T panel marks the surface inversion the lapse-rate panel
 # detects, so the detection itself lives there and is shared from there.
 from lapse_rate import find_surface_inversion_top
@@ -271,16 +271,27 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         # giving a convective temperature barely above actual surface T.
         T_for_ccl = median_filter(T.m, size=5, mode='nearest') * units.degC
         Td_for_ccl = median_filter(Td.m, size=5, mode='nearest') * units.degC
-        ccl_pressure, ccl_temperature, convective_temp = mpcalc.ccl(
-            p, T_for_ccl, Td_for_ccl, which='bottom')
-        skew.plot(ccl_pressure, ccl_temperature, marker='^', color='black',
-                 markerfacecolor='none', markersize=9, linestyle='none',
-                 label='Convective condensation level')
-        conv_path_pressure = units.Quantity(np.linspace(p[0].m, ccl_pressure.m, 50), 'hPa')
-        conv_path_temp = mpcalc.dry_lapse(conv_path_pressure, convective_temp).to('degC')
-        skew.plot(conv_path_pressure, conv_path_temp, color='darkorange', linewidth=1.2,
-                 linestyle='solid', alpha=0.8,
-                 label=f'Convective temperature ({convective_temp.m:.1f}\N{DEGREE SIGN}C)')
+        # A dry enough profile simply has no CCL: the surface mixing-ratio
+        # line never meets the temperature curve within the data. MetPy
+        # indexes its (empty) intersection array unconditionally and so
+        # raises IndexError rather than returning nan, which would take
+        # the whole plot down over an annotation that legitimately doesn't
+        # exist here -- so treat it as "no CCL" and carry on without it.
+        try:
+            ccl_pressure, ccl_temperature, convective_temp = mpcalc.ccl(
+                p, T_for_ccl, Td_for_ccl, which='bottom')
+        except IndexError:
+            ccl_pressure = ccl_temperature = convective_temp = None
+
+        if ccl_pressure is not None:
+            skew.plot(ccl_pressure, ccl_temperature, marker='^', color='black',
+                     markerfacecolor='none', markersize=9, linestyle='none',
+                     label='Convective condensation level')
+            conv_path_pressure = units.Quantity(np.linspace(p[0].m, ccl_pressure.m, 50), 'hPa')
+            conv_path_temp = mpcalc.dry_lapse(conv_path_pressure, convective_temp).to('degC')
+            skew.plot(conv_path_pressure, conv_path_temp, color='darkorange', linewidth=1.2,
+                     linestyle='solid', alpha=0.8,
+                     label=f'Convective temperature ({convective_temp.m:.1f}\N{DEGREE SIGN}C)')
 
         # The mixing line (constant mixing ratio) from the surface dewpoint
         # up to the higher of the LCL/CCL -- the classic graphical
@@ -290,7 +301,9 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         # itself for the CCL. Both land on this same line since both are
         # built from the same starting (surface) dewpoint.
         surface_mixing_ratio = mpcalc.saturation_mixing_ratio(p[0], Td[0])
-        mixing_line_top = min(lcl_pressure.m, ccl_pressure.m)
+        # Up to the LCL alone when there's no CCL to be the higher of the two.
+        mixing_line_top = (lcl_pressure.m if ccl_pressure is None
+                           else min(lcl_pressure.m, ccl_pressure.m))
         skew.plot_mixing_lines(
             mixing_ratio=np.atleast_1d(surface_mixing_ratio.m),
             pressure=units.Quantity(np.linspace(p[0].m, mixing_line_top, 50), 'hPa'),
@@ -513,7 +526,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
     # single line sharing that row.
     local_dt = sounding_date.astimezone(tz)
     title_left = title_prefix if title_prefix is not None else f'{station} Observed Sounding'
-    title_right = f'{local_dt:%Y-%m-%d %H:%M} {gmt_offset_label(local_dt)} {local_dt:%Z}'
+    title_right = f'{local_dt:%Y-%m-%d %H:%M} {local_dt:%Z} ({utc_offset_label(local_dt)})'
     extra_left_lines = [line for line in (site_name, location_desc) if line]
     if extra_left_lines:
         title_left += '\n' + '\n'.join(extra_left_lines)

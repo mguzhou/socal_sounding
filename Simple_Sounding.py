@@ -35,6 +35,16 @@ matplotlib.use('Agg')
 # here is ever consulted.
 matplotlib.rcParams['font.family'] = ['Fira Sans', 'DejaVu Sans']
 
+# Keep text as real <text> in the SVG instead of converting every glyph
+# to outlines (matplotlib's default, svg.fonttype='path'). Outlines are
+# self-contained but the labels stop being text: not selectable, not
+# searchable, not editable in Inkscape/Illustrator, and a good deal
+# bigger on disk. The tradeoff is that the viewer now needs Fira Sans
+# installed, falling back to whatever its renderer picks otherwise --
+# which is why font.family above names DejaVu Sans as the second choice.
+# Only affects SVG; the PNG is rasterised either way.
+matplotlib.rcParams['svg.fonttype'] = 'none'
+
 # Set before any project module pulls in pyplot, which the imports
 # below do -- so this stays above them.
 import matplotlib.pyplot as plt
@@ -43,7 +53,7 @@ from metpy.units import units
 from scipy.ndimage import median_filter
 
 from cli import parse_args
-from config import MODEL_PRIORITY, SHOW_PREVIOUS, gmt_offset_label
+from config import MODEL_PRIORITY, SHOW_PREVIOUS, utc_offset_label
 from geocode import describe_location
 from grib import fetch_hrrr_profile, fetch_rrfs_profile
 from lapse_rate import render_lapse_rate_panel
@@ -200,10 +210,10 @@ def main(args=None, output_dir=None):
     # The IANA zone name, not Open-Meteo's utc_offset_seconds: that field
     # is the zone's offset *right now*, not on the sounding's own date, so
     # using it mislabels anything on the other side of a DST transition by
-    # an hour (a January sounding rendered in July came out as GMT-7 when
-    # it was really PST/GMT-8). Converting each instant through the zone
+    # an hour (a January sounding rendered in July came out as UTC-7 when
+    # it was really PST/UTC-8). Converting each instant through the zone
     # itself gets the historical offset right, and gives a real PST/PDT
-    # abbreviation instead of a generic GMT-7.
+    # abbreviation instead of a bare numeric offset.
     try:
         tz = ZoneInfo(forecast['timezone'])
     except (KeyError, ZoneInfoNotFoundError):
@@ -216,7 +226,7 @@ def main(args=None, output_dir=None):
     if model_run_date is not None and model_run_date != date:
         run_local_dt = model_run_date.astimezone(tz)
         run_label = (f'Model run: {run_local_dt:%Y-%m-%d %H:%M} '
-                     f'{gmt_offset_label(run_local_dt)} {run_local_dt:%Z}')
+                     f'{run_local_dt:%Z} ({utc_offset_label(run_local_dt)})')
 
     fig = plt.figure(figsize=(9.5, 10))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.14)

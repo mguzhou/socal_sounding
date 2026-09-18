@@ -527,6 +527,10 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     # branches that actually use it, which matters most for a batch: every
     # site in a pinned run was paying for a lookup whose answer was thrown
     # away.
+    # Set only when a future valid time was asked for, which is the one
+    # case where an unavailable (run, lead) can be recovered by trying an
+    # older run at a longer lead -- see below.
+    hold_valid_time = None
     if run_datetime is not None:
         run_date = run_datetime.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         forecast_hour = forecast_hour if forecast_hour is not None else 0
@@ -544,7 +548,17 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
         if valid_time > latest_run:
             run_date = latest_run
             forecast_hour = round((valid_time - run_date).total_seconds() / 3600)
-            allow_retry = False  # a fixed (run, lead) pair -- stepping the run back would change the valid time
+            allow_retry = False
+            # The freshest run often can't reach far enough: these models
+            # only run to a long lead on their synoptic cycles (RRFS goes
+            # to f18 off-cycle but f84 from 00/06/12/18Z; verified against
+            # the bucket). Rather than give up, fall back to older runs
+            # that do cover this valid time -- holding the valid time
+            # fixed and *growing* the lead as the run steps back, so
+            # 21Z+f22 becomes 20Z+f23, 19Z+f24, 18Z+f25, which exists.
+            # (The plain retry below steps the run back at a fixed lead,
+            # which would silently move the valid time instead.)
+            hold_valid_time = valid_time
         else:
             run_date = valid_time
             forecast_hour = 0
@@ -560,7 +574,7 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
     search = rf':(?:HGT|TMP|DPT|UGRD|VGRD):(?:{wanted_levels}) mb:'
 
     grib_path = None
-    for _ in range(max_tries if allow_retry else 1):
+    for _ in range(max_tries if (allow_retry or hold_valid_time is not None) else 1):
         candidate_path = CACHE_DIR / f'{cache_prefix}_{run_date:%Y%m%d_%HZ}_f{forecast_hour:02d}.grib2'
         if candidate_path.exists():
             grib_path = candidate_path
@@ -569,6 +583,12 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
         h = Herbie(run_date.replace(tzinfo=None), model=model, product='prs',
                   fxx=forecast_hour, verbose=False)
         if h.grib is None:
+            if hold_valid_time is not None:
+                # Step back to an older run and lengthen the lead by the
+                # same hour, so the valid time being asked for doesn't move.
+                run_date -= timedelta(hours=1)
+                forecast_hour = round((hold_valid_time - run_date).total_seconds() / 3600)
+                continue
             if not allow_retry:
                 raise RuntimeError(f'{model.upper()} run {run_date:%Y-%m-%d %HZ} has no '
                                    f'f{forecast_hour:02d} forecast')
@@ -600,6 +620,10 @@ def _fetch_grib_profile(lat, lon, date, model, cache_prefix, forecast_hour=None,
         grib_path = candidate_path
         break
     else:
+        if hold_valid_time is not None:
+            raise RuntimeError(
+                f'No {model.upper()} run reaches {hold_valid_time:%Y-%m-%d %HZ} -- tried back to '
+                f'{run_date:%Y-%m-%d %HZ} at f{forecast_hour:02d}')
         raise RuntimeError(f'No {model.upper()} run found near {date}')
 
     levels, cone, lov = _decode_grib_fields(grib_path, lat, lon)
