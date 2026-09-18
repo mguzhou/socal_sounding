@@ -11,6 +11,11 @@ lifted-parcel analysis and thermal-top estimates. Two kinds of sounding:
 Output is `<station>_<valid time>.png` plus a matching `.svg`, written to
 the working directory.
 
+## Human Note and Attribution
+
+Guided by me through claude, using examples from MetPy's excellent documentation. Herbie is used to pull raw GRIB data.
+
+
 ## Quick start
 
 ```bash
