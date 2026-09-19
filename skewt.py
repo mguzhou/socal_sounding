@@ -13,6 +13,22 @@ from config import DEFAULT_ALTITUDE_UNIT, KM_TO_KFT, utc_offset_label
 # detects, so the detection itself lives there and is shared from there.
 from lapse_rate import find_surface_inversion_top
 
+# Depth over which the condensation levels take their moisture, as the
+# layer's mean mixing ratio rather than the single surface value.
+#
+# Real cumulus comes from a population of thermals with differing surface
+# moisture: the moistest condense, the rest don't, which is what partial
+# cover actually is. A lone 2 m dewpoint is one sample of that population
+# masquerading as the whole of it, and it is also the noisiest point in
+# the profile. Averaging over the mixed layer is the conventional fix
+# (the "mixed-layer parcel"), and it makes cloud base representative of
+# the thermals rather than of one grid cell's surface.
+#
+# 50 hPa, not the textbook 100 hPa: these are shallow, often
+# high-elevation boundary layers, and 100 hPa would average in free
+# atmosphere well above the layer thermals actually mix.
+MIXED_LAYER_DEPTH = units.Quantity(50, 'hPa')
+
 
 ###########################################
 # Special lines. Dry adiabats are clipped so each one starts at the bottom
@@ -220,15 +236,23 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
             parcel_suffix = ' - OpenMeteo'
 
         forecast_uncertainty = 1.0
+        # Moisture for every condensation calculation below: the mixed
+        # layer's mean mixing ratio, expressed as the dewpoint a surface
+        # parcel would carry (see MIXED_LAYER_DEPTH). Only the moisture is
+        # taken from the mix -- the parcel is still heated to base_temp,
+        # the model's own surface temperature, since that is what drives
+        # the thermal.
+        _, _, mixed_dewpoint = mpcalc.mixed_parcel(p, T, Td, depth=MIXED_LAYER_DEPTH)
+
         # Full parcel ascent (dry below the LCL, moist above) starting from
-        # the surface, using the sounding's own surface dewpoint -- shows
-        # any CAPE a parcel heated to base_temp would actually have.
+        # the surface -- shows any CAPE a parcel heated to base_temp would
+        # actually have.
         forecast_profile = mpcalc.parcel_profile(
-            p, units.Quantity(base_temp, 'degC'), Td[0]).to('degC')
+            p, units.Quantity(base_temp, 'degC'), mixed_dewpoint).to('degC')
         forecast_profile_minus = mpcalc.parcel_profile(
-            p, units.Quantity(base_temp - forecast_uncertainty, 'degC'), Td[0]).to('degC')
+            p, units.Quantity(base_temp - forecast_uncertainty, 'degC'), mixed_dewpoint).to('degC')
         forecast_profile_plus = mpcalc.parcel_profile(
-            p, units.Quantity(base_temp + forecast_uncertainty, 'degC'), Td[0]).to('degC')
+            p, units.Quantity(base_temp + forecast_uncertainty, 'degC'), mixed_dewpoint).to('degC')
         skew.plot(p, forecast_profile, color='black', linewidth=1.2, linestyle='solid',
                  label=f'{parcel_label} parcel ({base_temp:.1f} \N{PLUS-MINUS SIGN} '
                        f'{forecast_uncertainty:.1f}) \N{DEGREE SIGN}C{parcel_suffix}')
@@ -237,7 +261,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         # it would saturate, i.e. the base of any clouds that heating to
         # base_temp would produce.
         lcl_pressure, lcl_temperature = mpcalc.lcl(
-            p[0], units.Quantity(base_temp, 'degC'), Td[0])
+            p[0], units.Quantity(base_temp, 'degC'), mixed_dewpoint)
 
         parcel_p_path = p
         parcel_T_path = T
@@ -279,7 +303,8 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         # exist here -- so treat it as "no CCL" and carry on without it.
         try:
             ccl_pressure, ccl_temperature, convective_temp = mpcalc.ccl(
-                p, T_for_ccl, Td_for_ccl, which='bottom')
+                p, T_for_ccl, Td_for_ccl,
+                mixed_layer_depth=MIXED_LAYER_DEPTH, which='bottom')
         except IndexError:
             ccl_pressure = ccl_temperature = convective_temp = None
 
@@ -300,7 +325,7 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         # parcel's dry adiabat for the LCL, the environmental profile
         # itself for the CCL. Both land on this same line since both are
         # built from the same starting (surface) dewpoint.
-        surface_mixing_ratio = mpcalc.saturation_mixing_ratio(p[0], Td[0])
+        surface_mixing_ratio = mpcalc.saturation_mixing_ratio(p[0], mixed_dewpoint)
         # Up to the LCL alone when there's no CCL to be the higher of the two.
         mixing_line_top = (lcl_pressure.m if ccl_pressure is None
                            else min(lcl_pressure.m, ccl_pressure.m))
@@ -411,7 +436,8 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
         mixing_top_pressures = [mid_top] if mid_top is not None else []
         for profile, bound_temp in ((forecast_profile_plus, base_temp + forecast_uncertainty),
                                     (forecast_profile_minus, base_temp - forecast_uncertainty)):
-            bound_lcl_pressure, _ = mpcalc.lcl(p[0], units.Quantity(bound_temp, 'degC'), Td[0])
+            bound_lcl_pressure, _ = mpcalc.lcl(p[0], units.Quantity(bound_temp, 'degC'),
+                                               mixed_dewpoint)
             top, _ = capped_mixing_top(p, T, profile, bound_lcl_pressure.m)
             if top is None:
                 continue
@@ -432,6 +458,62 @@ def render_skewt_panel(fig, subplot, sounding_df, sounding_date, tz,
             skew.ax.axhspan(min(mixing_top_pressures), max(mixing_top_pressures),
                             color='steelblue', alpha=0.12,
                             label=f'Thermal top uncertainty ({mixing_height_range_m:,.0f} m)')
+
+        # The cloud layer -- labelled by depth rather than by cloud type,
+        # since the same calculation covers everything from a shallow fair
+        # weather cumulus to a 5.8 km cumulonimbus (SLC, verified), and
+        # naming one of those would be wrong for the other.
+        #
+        # Cloud base is the LCL, but only where the
+        # parcel actually got there under its own buoyancy -- which is
+        # exactly what capped_mixing_top reports via mid_is_cloud_base
+        # (it caps the thermal top at the LCL and says so when it did).
+        # Where thermals top out below the LCL instead, the day is blue
+        # and nothing is drawn, which keeps a blue day visibly blue.
+        #
+        # Cloud top is the equilibrium level -- where the saturated
+        # parcel, now following the moist adiabat, finally loses its
+        # buoyancy. Note this is the one place el() is the right tool:
+        # it is deliberately avoided for the *thermal* top above (see
+        # capped_mixing_top, which wants the first crossing, not the
+        # last), but the last crossing is precisely what caps a cloud.
+        if mid_is_cloud_base and mid_top is not None:
+            el_pressure, _ = mpcalc.el(p, T, Td, forecast_profile)
+            # No EL doesn't mean no cloud top -- it usually means the top
+            # is above the data. These profiles stop at 400 mb (see
+            # MODEL_PRESSURE_LEVELS) while a convective EL commonly sits
+            # nearer 200-300 mb, so a parcel still buoyant at the ceiling
+            # never crosses back and el() returns nan. Measured on a test
+            # profile with 826 J/kg of CAPE. Fall back to the top of the
+            # data and mark the depth as a lower bound, rather than
+            # drawing no cloud at all on the very days that have one.
+            open_topped = el_pressure is None or not np.isfinite(el_pressure.m)
+            cloud_top = p.m.min() if open_topped else el_pressure.m
+            if cloud_top < mid_top:
+                cloud_depth_m = (pressure_to_height_km(cloud_top)[0]
+                                 - pressure_to_height_km(mid_top)[0]) * 1000
+                depth_text = (f'\N{GREATER-THAN OR EQUAL TO}{cloud_depth_m:,.0f} m deep'
+                              if open_topped else f'{cloud_depth_m:,.0f} m deep')
+                # Drawn as a narrow column in the left margin rather than
+                # a full-width band: a deep cloud spans most of the plot
+                # (SLC verified at 5,764 m, base 2,652 m against a 6 km
+                # axis cap), and shading all of that washes out the
+                # traces, barbs and the thermal-top band underneath it.
+                # A margin column shows base and top just as precisely
+                # without covering the data.
+                #
+                # Blended transform: x in axes fractions so the column
+                # keeps its width and stays vertical despite the skewed
+                # x-axis, y in data coordinates so it tracks pressure
+                # correctly on the log scale. fill_betweenx rather than a
+                # Rectangle for that same reason -- a Rectangle's height
+                # is linear and would misplace the top.
+                cloud_trans = matplotlib.transforms.blended_transform_factory(
+                    skew.ax.transAxes, skew.ax.transData)
+                skew.ax.fill_betweenx(np.linspace(mid_top, cloud_top, 50), 0.015, 0.075,
+                                      transform=cloud_trans, color='lightblue', alpha=0.85,
+                                      edgecolor='steelblue', linewidth=0.6, zorder=2.5,
+                                      label=f'Cloud depth ({depth_text})')
 
         skew.shade_cape(p, T, forecast_profile_plus, alpha=0.1)
         skew.shade_cin(p, T, forecast_profile_minus, alpha=0.05)

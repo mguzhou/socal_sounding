@@ -219,14 +219,21 @@ def main(args=None, output_dir=None):
     except (KeyError, ZoneInfoNotFoundError):
         tz = timezone.utc
 
-    # Label the model run that actually generated this profile whenever it's
-    # a real forecast (run time != valid time) -- otherwise it's implicit
-    # (the sounding's own time in the title already is the run time).
+    # Label the model run behind this profile -- for every modeled
+    # sounding, including an analysis. This used to be skipped when the run
+    # time equalled the valid time, on the grounds that the title's own
+    # time is then the run time; but nothing on the plot said so, which
+    # left no way to tell an analysis from a forecast, or to see which run
+    # it came from at all. The lead comes along for the same reason, in the
+    # models' own fXX notation (f00 being the analysis) -- the fallback to
+    # older synoptic cycles means the lead is no longer predictable from
+    # the run time alone.
     run_label = None
-    if model_run_date is not None and model_run_date != date:
+    if model_run_date is not None:
         run_local_dt = model_run_date.astimezone(tz)
+        lead_hours = round((date - model_run_date).total_seconds() / 3600)
         run_label = (f'Model run: {run_local_dt:%Y-%m-%d %H:%M} '
-                     f'{run_local_dt:%Z} ({utc_offset_label(run_local_dt)})')
+                     f'{run_local_dt:%Z} ({utc_offset_label(run_local_dt)}), f{lead_hours:02d}')
 
     fig = plt.figure(figsize=(9.5, 10))
     gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.14)

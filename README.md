@@ -161,11 +161,12 @@ cache is keyed by run, never by point, so it only grows with new runs.
 /sites                             list the named sites
 ```
 
-Named sites come from `../sites.tsv`: one `name  lat  lon` per line.
-Despite the extension the columns are separated by runs of *spaces*, not
-tabs, which is why the parser splits on `\s+` — and why the site name
-itself is allowed to contain single spaces. The longest matching prefix
-wins, so a trailing datetime doesn't confuse a two-word name.
+Named sites come from `../sites.tsv`: one tab-separated `name`, `lat`,
+`lon` per line. The parser splits on `\s+` rather than on tabs
+specifically, so space-aligned lines still work — but a site name may
+contain single spaces ("Little Black"), so keep the columns tab-separated
+to avoid ambiguity. The longest matching prefix wins, so a trailing
+datetime doesn't confuse a two-word name.
 
 Renders run in-process on a worker thread behind a lock, because pyplot
 is global mutable state — concurrent requests queue rather than
